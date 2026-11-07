@@ -1,5 +1,5 @@
 """
-models.py - the data shapes produced by phase 1 (filter and fingerprint).
+models.py - data shapes produced by each repo-analyzer phase.
 
 Every phase returns a pydantic model instead of a loose dict. That gives you:
   * a clear contract between phases (and between teammates),
@@ -55,4 +55,32 @@ class FilterResult(BaseModel):
     skipped_counts: dict[str, int] = Field(default_factory=dict)  # exact counts per reason
     total_bytes: int = 0
     fingerprint: str = ""    # SHA-256 over every kept file's path and content hash
+    warnings: list[str] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: Discovery and structuring
+# --------------------------------------------------------------------------- #
+
+
+class LanguageCount(BaseModel):
+    """How many kept source files use a given language label."""
+    language: str
+    count: int
+
+
+class SubProject(BaseModel):
+    """One buildable unit inside the repository (the repo root counts as one)."""
+    path: str = ""  # relative directory; "" is the repository root
+    languages: list[LanguageCount] = Field(default_factory=list)
+    manifests: list[str] = Field(default_factory=list)  # kept manifest paths in this unit
+    files: list[str] = Field(default_factory=list)      # all kept paths assigned here
+
+
+class DiscoveryResult(BaseModel):
+    """Output of phase 2."""
+    root: str
+    fingerprint: str = ""  # copied from phase 1 so later phases can correlate snapshots
+    languages: list[LanguageCount] = Field(default_factory=list)       # whole repo
+    sub_projects: list[SubProject] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
