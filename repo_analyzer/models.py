@@ -84,3 +84,32 @@ class DiscoveryResult(BaseModel):
     languages: list[LanguageCount] = Field(default_factory=list)       # whole repo
     sub_projects: list[SubProject] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+
+@dataclass
+class AstFact:
+    node_type: str
+    name: str
+    lineno: int
+    col_offset: int = 0
+
+@dataclass
+class SecurityRisk:
+    risk_type: str
+    message: str
+    lineno: int
+
+@dataclass
+class FileAnalysisResult:
+    file_path: str
+    ast_facts: list[AstFact] = field(default_factory=list)
+    risks: list[SecurityRisk] = field(default_factory=list)
+
+@dataclass
+class StaticAnalysisResult:
+    root: str
+    file_results: list[FileAnalysisResult] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
