@@ -86,7 +86,7 @@ class DiscoveryResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-from __future__ import annotations
+# from __future__ import annotations
 from dataclasses import dataclass, field
 
 @dataclass
@@ -113,3 +113,28 @@ class StaticAnalysisResult:
     root: str
     file_results: list[FileAnalysisResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+    
+
+# --------------------------------------------------------------------------- #
+# Phase 4: Recipe extraction
+# --------------------------------------------------------------------------- #
+
+
+class Recipe(BaseModel):
+    """How to install and test one sub-project."""
+    sub_project: str = ""   # relative directory; "" is the repository root
+    ecosystem: str          # e.g. "python"
+    install_commands: list[str] = Field(default_factory=list)
+    test_commands: list[str] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"] = "low"
+    evidence: list[str] = Field(default_factory=list)  # why we think so
+
+
+class RecipeResult(BaseModel):
+    """Output of phase 4."""
+    root: str
+    fingerprint: str = ""
+    recipes: list[Recipe] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
