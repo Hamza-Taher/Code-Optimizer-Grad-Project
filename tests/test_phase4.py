@@ -63,3 +63,12 @@ def test_fingerprint_is_copied_from_phase_1(tmp_path):
     phase1 = filter_repo(tmp_path)
     result = extract_recipes(discover(phase1))
     assert result.fingerprint == phase1.fingerprint
+
+def test_nested_requirements_is_not_used_for_root(tmp_path):
+    write(tmp_path, "app.py", "x = 1\n")
+    write(tmp_path, "services/api/requirements.txt", "flask\n")
+    r = _recipe(_recipes(tmp_path), "")
+    assert r.install_commands == []
+    assert r.confidence == "low"
+
+    

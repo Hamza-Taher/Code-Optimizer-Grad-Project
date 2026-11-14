@@ -19,7 +19,9 @@ def _is_test_file(path: str) -> bool:
 
 
 def _python_recipe(sp: SubProject) -> Recipe | None:
-    names = {posixpath.basename(f) for f in sp.files}
+    # names = {posixpath.basename(f) for f in sp.files}
+    prefix = f"{sp.path}/" if sp.path else ""
+    names = {f[len(prefix):] for f in sp.files if f.startswith(prefix) and "/" not in f[len(prefix):]}
     is_python = any(lang.language == "Python" for lang in sp.languages)
     if not is_python:
         return None
