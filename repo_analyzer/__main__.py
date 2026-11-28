@@ -7,8 +7,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from .models import DiscoveryResult, FilterResult
-from .phase1_filter import FilterOptions, filter_repo
-from .phase2_discovery import discover
+from .repo_analyzer_core import FilterOptions, discover, filter_repo
 
 
 class AnalyzeOutput(BaseModel):
