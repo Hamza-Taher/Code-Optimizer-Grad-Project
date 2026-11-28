@@ -1,4 +1,4 @@
-"""Repo analyzer. Phase 1: filter and fingerprint. Phase 2: discovery."""
+"""Repo analyzer. Phases 1-2 in repo_analyzer_core; later phases in separate modules until integrated."""
 from .models import (
     DiscoveryResult,
     FileEntry,
@@ -8,8 +8,7 @@ from .models import (
     SkippedEntry,
     SubProject,
 )
-from .phase1_filter import FilterOptions, filter_repo, read_text
-from .phase2_discovery import discover
+from .repo_analyzer_core import FilterOptions, discover, filter_repo, read_text
 
 __all__ = [
     "DiscoveryResult",

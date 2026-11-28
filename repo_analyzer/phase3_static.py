@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from .models import AstFact, FileAnalysisResult, SecurityRisk, StaticAnalysisResult
-from .phase1_filter import read_text
+from .repo_analyzer_core import read_text
 
 class _CodeVisitor(ast.NodeVisitor):
     def __init__(self) -> None:

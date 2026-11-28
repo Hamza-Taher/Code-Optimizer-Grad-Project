@@ -2,7 +2,7 @@
 
 An enterprise multi-agent system for autonomous source-code refactoring, complexity reduction, and sandboxed test validation.
 
-This repository currently contains **Phases 1 and 2 of the repo analyzer**: filter and fingerprint, then discovery and structuring. There is no user interface and no backend yet. Later phases of the same agent are added as new modules inside `repo_analyzer/`, not as new top-level folders.
+This repository contains the **repo analyzer** (phases 1–6 in progress). Phases **1 and 2** are integrated in [`repo_analyzer_core.py`](repo_analyzer/repo_analyzer_core.py); phases 3–6 still live in separate modules until integrated. There is no user interface or backend yet.
 
 ## Where Phases 1 and 2 sit
 
@@ -39,18 +39,31 @@ The fingerprint is a SHA-256 over each kept file's path and content hash, sorted
 
 ```
 repo_analyzer/
-  __init__.py          public exports
-  __main__.py          command line
-  models.py            pydantic models for each phase
-  phase1_filter.py     the walk and the skip rules
-  phase2_discovery.py  languages, manifests, sub-projects
+  __init__.py            public exports
+  __main__.py            command line
+  models.py              pydantic models for each phase
+  repo_analyzer_core.py  Phases 1–2 (filter + discovery); grows via integrate PRs
+  phase3_static.py       Phase 3 (until merged into core)
+  phase4_recipe.py       …
 tests/
-  helpers.py           builds tiny fake repositories for tests
-  test_phase1.py       Phase 1 tests
-  test_phase2.py       Phase 2 tests
+  helpers.py
+  test_repo_analyzer_core.py   Phases 1–2 tests
+  test_phase3.py …             other phases until integrated
 requirements.txt
 pytest.ini
 ```
+
+### Integrate branch convention (for teammates)
+
+Use **`feature/repo-analyzer-integrate-phases-<from>-<to>-core`** when merging separate phase modules **into** `repo_analyzer_core.py` (not when adding a brand-new phase feature).
+
+| Step | Branch example | Action |
+|------|----------------|--------|
+| Done | `feature/repo-analyzer-integrate-phases-1-2-core` | Phases 1 + 2 in core; `test_repo_analyzer_core.py` |
+| Next | `feature/repo-analyzer-integrate-phases-1-3-core` | Move Phase 3 into core; delete `phase3_static.py`; fold tests |
+| Later | `feature/repo-analyzer-integrate-phases-1-N-core` | Same pattern |
+
+New phase **features** still use names like `feature/repo-analyzer-p4-recipe-extraction` until an integrate PR folds them into core.
 
 Every phase returns a pydantic model instead of a plain dictionary. That is the contract between phases and between teammates. `result.model_dump_json()` is the JSON form.
 
@@ -232,7 +245,7 @@ The tests build a tiny fake repository per case. They cover directory skips, nes
 
 Phase 2 tests cover single and nested projects, npm/pnpm/Cargo workspaces, nested `requirements.txt`, vendor paths, lockfiles, and deepest sub-project assignment.
 
-On Windows, two Phase 1 tests are skipped: creating a symlink needs a privilege this environment does not grant, and the unreadable-file case depends on POSIX permissions. Both still run on Linux and macOS. The last full run here was **28 passed, 2 skipped**.
+On Windows, some tests are skipped (symlinks, deep paths, POSIX-only permissions, named pipes). The last full run here was **40 passed, 7 skipped**.
 
 ## What is not implemented yet
 

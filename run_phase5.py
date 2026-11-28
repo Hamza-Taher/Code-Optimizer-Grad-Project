@@ -1,5 +1,4 @@
-from repo_analyzer.phase1_filter import filter_repo
-from repo_analyzer.phase2_discovery import discover
+from repo_analyzer import discover, filter_repo
 from repo_analyzer.phase4_recipe import extract_recipes
 from repo_analyzer.phase5_sandbox import verify_recipes
 
