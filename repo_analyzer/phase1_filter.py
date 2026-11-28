@@ -4,18 +4,25 @@ phase1_filter.py - Phase 1: Filter and fingerprint.
 Goal: decide which files are worth analyzing, record why the others were skipped, and
 fingerprint exactly what was kept.
 
-Why this runs FIRST (before discovery): language counts and manifest searches must not
-see vendored code, virtual environments, generated files or binaries. Otherwise a
-vendored package's pyproject.toml would look like one of your sub-projects.
+Why this runs FIRST: later phases (language counts, manifest search, ...) must not see vendored
+code, virtual environments, generated files or binaries. Otherwise a vendored package's
+pyproject.toml would look like one of your sub-projects.
 
-Safe by design: it only lists and reads files. It never executes anything and never
-follows symbolic links.
+Safe by design: it only lists and reads files. It never executes anything, never follows
+symbolic links, and never opens anything that is not a regular file.
+
+How this file is organised (top to bottom):
+  1. Settings        - every list and limit you may want to tune
+  2. Ignore rules    - .gitignore / .analyzerignore handling
+  3. Decisions       - small functions that answer "skip this folder / file?"
+  4. filter_repo()   - the walk that ties it together
 """
 from __future__ import annotations
 
 import hashlib
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,35 +31,57 @@ import pathspec
 from .models import FileEntry, FilterResult, SkippedEntry, SkipReason
 
 # =========================================================================== #
-# Settings - everything tunable is here
+# 1. Settings
 # =========================================================================== #
 
-# Folders that are never analyzed: version control, caches, build output.
+# Folders that are never analyzed: version control, caches, editor settings, build output.
 SKIP_DIR_NAMES = {
-    ".git", ".hg", ".svn", "__pycache__", ".tox", ".nox", ".mypy_cache", ".pytest_cache",
-    ".ruff_cache", ".hypothesis", "htmlcov", ".eggs", "build", "dist",
+    ".git", ".hg", ".svn",
+    "__pycache__", ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".hypothesis",
+    "htmlcov", ".eggs", "__pypackages__", ".ipynb_checkpoints",
+    "build", "dist",
+    ".idea", ".vscode",
+    ".next", ".nuxt", ".svelte-kit", ".parcel-cache", ".turbo", ".nyc_output", ".yarn", ".pnpm-store",
+    ".gradle", ".terraform", ".dart_tool", ".cache",
 }
-# Folders that hold third-party code copied into the repo.
+# "target" is build output for Rust and Maven, but a normal folder name elsewhere, so it is only
+# skipped when one of these files sits next to it.
+TARGET_DIR_PROOF = {"Cargo.toml", "pom.xml"}
+
+# Folders that hold third-party code copied into the repo (compared in lower case).
 VENDOR_DIR_NAMES = {
     "vendor", "vendors", "third_party", "third-party", "thirdparty",
     "node_modules", "bower_components", "site-packages",
 }
-# Folder names that are always virtual environments. Other names are caught by the
-# pyvenv.cfg marker file instead (so a venv called "myenv" is still found).
+# Folder names that are always virtual environments. Other names are caught by a marker
+# (pyvenv.cfg for venv/virtualenv, a conda-meta folder for conda), so a venv called "myenv"
+# is still found.
 VENV_DIR_NAMES = {"venv", ".venv"}
 
 # Extensions we never read: they are binary by nature.
 BINARY_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svgz", ".pdf",
+    ".tif", ".tiff", ".heic", ".avif", ".psd",
     ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".tar", ".rar", ".whl", ".egg",
-    ".so", ".dll", ".dylib", ".exe", ".bin", ".o", ".a", ".obj",
-    ".pyc", ".pyo", ".pyd", ".class", ".jar", ".war",
+    ".iso", ".dmg", ".apk", ".ipa", ".deb", ".rpm", ".msi", ".nupkg", ".gem",
+    ".so", ".dll", ".dylib", ".exe", ".bin", ".o", ".a", ".lib", ".obj", ".pdb", ".node", ".wasm",
+    ".pyc", ".pyo", ".pyd", ".class", ".jar", ".war", ".ear",
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
-    ".mp3", ".mp4", ".mov", ".avi", ".wav", ".sqlite", ".db", ".pkl", ".npy", ".parquet",
+    ".mp3", ".mp4", ".mov", ".avi", ".wav", ".mkv", ".flac", ".ogg", ".webm", ".m4a",
+    ".sqlite", ".sqlite3", ".db", ".pkl", ".pickle", ".npy", ".npz", ".parquet",
+    ".h5", ".hdf5", ".onnx", ".pt", ".pth", ".ckpt", ".safetensors",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt",
 }
 
 # Machine-written code, recognised by file name...
-GENERATED_NAME = re.compile(r"(_pb2(_grpc)?\.pyi?|\.min\.(js|css)|\.generated\.\w+)$")
+GENERATED_NAME = re.compile(
+    r"(_pb2(_grpc)?\.pyi?"                    # python protobuf / grpc output
+    r"|\.pb\.(go|cc|h)"                       # protobuf output for Go / C++
+    r"|\.min\.(js|css)|\.(js|css)\.map"       # minified assets and their source maps
+    r"|\.generated\.\w+"                      # *.generated.*
+    r"|\.g\.(cs|dart)|\.freezed\.dart|\.designer\.cs)$"
+    r"|^zz_generated\."                       # Kubernetes-style generated Go files
+)
 # ...or by a marker in the first few lines of a source file (heuristic).
 GENERATED_HEADER = re.compile(
     r"@generated|do not edit|code generated|generated by|auto-?generated|automatically generated", re.I)
@@ -61,7 +90,7 @@ HEADER_LINES = 5
 # "generated by" in a README is never flagged.
 CODE_SUFFIXES = {
     ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".c", ".h",
-    ".cpp", ".hpp", ".cs", ".rb", ".php", ".kt", ".swift",
+    ".cpp", ".hpp", ".cs", ".rb", ".php", ".kt", ".swift", ".scala", ".dart", ".m", ".mm",
 }
 BINARY_SNIFF_BYTES = 8192  # a NUL byte in the first 8 KB means "binary"
 
@@ -75,57 +104,106 @@ class FilterOptions:
 
 
 # =========================================================================== #
-# Ignore rules
+# 2. Ignore rules
 # =========================================================================== #
 
-# A rule set is a list of (base folder, compiled patterns). `base` is the folder that
-# holds the ignore file, relative to the repo root ("" for the root itself).
-Rules = list[tuple[str, pathspec.GitIgnoreSpec]]
+
+class IgnoreFile:
+    """The patterns of ONE ignore file. They apply relative to `base`, the folder holding the
+    file ("" for the repo root), which is how git scopes a nested .gitignore."""
+
+    def __init__(self, base: str, spec: pathspec.GitIgnoreSpec):
+        self.base, self.spec = base, spec
+
+    def verdict(self, rel: str, is_dir: bool) -> bool | None:
+        """True = ignored, False = re-included by a '!' rule, None = this file has no opinion.
+        Folders get a trailing '/' because rules like 'out/' only match folders."""
+        sub = rel[len(self.base):].lstrip("/")
+        return self.spec.check_file(sub + "/" if is_dir else sub).include
 
 
-def _spec_from_file(path: Path) -> pathspec.GitIgnoreSpec | None:
-    """Compile one ignore file. Reads leniently so a non-UTF-8 file can never crash the scan."""
-    if not path.is_file():
-        return None
-    return pathspec.GitIgnoreSpec.from_lines(path.read_text(encoding="utf-8", errors="ignore").splitlines())
-
-
-def _matches(rules: Rules, rel: str, is_dir: bool) -> bool:
-    """True if any rule matches. Patterns are tested relative to the folder holding the ignore
-    file; folders get a trailing '/' because .gitignore rules like 'out/' only match folders.
-    (Simplification: a match in ANY file ignores the path; nested '!negation' is not modeled.)"""
-    for base, spec in rules:
-        sub = rel[len(base):].lstrip("/") if base else rel
-        if spec.match_file(sub + "/" if is_dir else sub):
-            return True
+def is_ignored(rules: list[IgnoreFile], rel: str, is_dir: bool) -> bool:
+    """Git precedence: the ignore file closest to the path decides. `rules` runs from the repo
+    root down, so look from the end; the first file with an opinion wins (a deeper '!rule' can
+    therefore bring back something a parent ignore file matched)."""
+    for rule in reversed(rules):
+        verdict = rule.verdict(rel, is_dir)
+        if verdict is not None:
+            return verdict
     return False
 
 
+def _read_ignore_lines(path: str) -> list[str]:
+    """Lines of an ignore file; [] when it is missing, unreadable, or not a regular file.
+    Symlinked ignore files are not followed (same rule as everywhere else). A UTF-8 BOM is
+    dropped and bad bytes are replaced, so a strange file can never crash the scan."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return []
+        with open(path, encoding="utf-8-sig", errors="ignore") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def compile_ignore(base: str, lines: list[str], label: str, warnings: list[str]) -> IgnoreFile | None:
+    """Compile pattern lines. One malformed line must not abort the scan: fall back to compiling
+    line by line, drop the bad ones and say so in the warnings."""
+    try:
+        return IgnoreFile(base, pathspec.GitIgnoreSpec.from_lines(lines)) if lines else None
+    except Exception:  # noqa: BLE001 - pathspec raises several different error types
+        good = []
+        for line in lines:
+            try:
+                pathspec.GitIgnoreSpec.from_lines([line])
+                good.append(line)
+            except Exception:  # noqa: BLE001
+                warnings.append(f"Ignored invalid pattern {line!r} in {label}.")
+        return IgnoreFile(base, pathspec.GitIgnoreSpec.from_lines(good)) if good else None
+
+
 # =========================================================================== #
-# Per-entry decisions (small functions, so each rule is easy to read and test)
+# 3. Decisions (small functions, so each rule is easy to read and test)
 # =========================================================================== #
 
 
-def _dir_skip_reason(full: Path, rel: str, name: str, git: Rules, user: Rules) -> SkipReason | None:
-    """Why a sub-folder should be skipped, or None to descend into it. Order matters."""
-    if full.is_symlink():
-        return "symlink"
-    if name in SKIP_DIR_NAMES or name.endswith(".egg-info"):
+def is_link(entry: os.DirEntry) -> bool:
+    """Symbolic link, or a Windows junction (which a plain walk would follow into loops)."""
+    is_junction = getattr(entry, "is_junction", None)  # Python 3.12+
+    return entry.is_symlink() or bool(is_junction and is_junction())
+
+
+def is_clean_name(name: str) -> bool:
+    """False for names with undecodable bytes: they show up as lone surrogates and cannot be
+    written to JSON or hashed."""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def dir_skip_reason(path: str, rel: str, name: str, siblings: set[str],
+                    git: list[IgnoreFile], user: list[IgnoreFile]) -> SkipReason | None:
+    """Why a sub-folder should be skipped, or None to descend into it. First match wins.
+    `siblings` are the entry names in the folder that contains this one."""
+    if name in SKIP_DIR_NAMES or name.endswith(".egg-info") or (name == "target" and siblings & TARGET_DIR_PROOF):
         return "ignored_dir"
-    if name in VENV_DIR_NAMES or (full / "pyvenv.cfg").is_file():
+    if name in VENV_DIR_NAMES or os.path.isfile(os.path.join(path, "pyvenv.cfg")) \
+            or os.path.isdir(os.path.join(path, "conda-meta")):
         return "virtualenv"
     if name.lower() in VENDOR_DIR_NAMES:
         return "vendor"
-    if os.path.lexists(full / ".git"):  # only sub-folders are checked, so the root's own .git is not an issue
+    if os.path.lexists(os.path.join(path, ".git")):   # only sub-folders get here, so the root's own .git is no problem
         return "nested_repo"
-    if _matches(git, rel, True):
+    if is_ignored(git, rel, True):
         return "gitignored"
-    if _matches(user, rel, True):
+    if is_ignored(user, rel, True):
         return "user_ignored"
     return None
 
 
-def _looks_generated(suffix: str, data: bytes) -> bool:
+def looks_generated(suffix: str, data: bytes) -> bool:
     """Heuristic: a source file whose first lines say it was machine-generated."""
     if suffix not in CODE_SUFFIXES:
         return False
@@ -133,8 +211,58 @@ def _looks_generated(suffix: str, data: bytes) -> bool:
     return bool(GENERATED_HEADER.search("\n".join(head.splitlines()[:HEADER_LINES])))
 
 
+def read_for_filter(entry: os.DirEntry, max_bytes: int) -> tuple[SkipReason | None, bytes]:
+    """Read a file once (the bytes feed the NUL check, the header check and the hash).
+    Returns (skip reason, data); the reason is set when the file must not be analyzed.
+    OSError is left to the caller, which records the file as unreadable."""
+    st = entry.stat(follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode):        # pipe, socket, device: opening one could block forever
+        return "unreadable", b""
+    if st.st_size > max_bytes:
+        return "too_large", b""
+    with open(entry.path, "rb") as f:
+        data = f.read(max_bytes + 1)         # bounded, in case the file grew since stat()
+    return ("too_large", b"") if len(data) > max_bytes else (None, data)
+
+
+def file_suffix(name: str) -> str:
+    """Lower-case extension (".py"), or "" for no extension and for dotfiles like ".gitignore"."""
+    dot = name.rfind(".")
+    return name[dot:].lower() if 0 < dot < len(name) - 1 else ""
+
+
+def printable(rel: str) -> str:
+    """Make a path safe to store and print even if it holds bytes that are not valid Unicode."""
+    return rel.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def judge_file(e: os.DirEntry, rel: str, git: list[IgnoreFile], user: list[IgnoreFile],
+               max_bytes: int) -> tuple[SkipReason | None, FileEntry | None]:
+    """Decide one file: returns (None, FileEntry) to keep it or (reason, None) to skip it.
+    Checks run in the documented order: cheap name-based ones first, then the ones that read
+    the file."""
+    suffix = file_suffix(e.name)
+    if is_ignored(git, rel, False):
+        return "gitignored", None
+    if is_ignored(user, rel, False):
+        return "user_ignored", None
+    if suffix in BINARY_SUFFIXES:
+        return "binary", None
+    if GENERATED_NAME.search(e.name):
+        return "generated", None
+    reason, data = read_for_filter(e, max_bytes)
+    if reason is None and b"\0" in data[:BINARY_SNIFF_BYTES]:
+        reason = "binary"
+    elif reason is None and looks_generated(suffix, data):
+        reason = "generated"
+    if reason:
+        return reason, None
+    # size comes from the bytes we hashed, so size and sha256 always describe the same content
+    return None, FileEntry(path=rel, size=len(data), sha256=hashlib.sha256(data).hexdigest(), suffix=suffix)
+
+
 # =========================================================================== #
-# The phase
+# 4. The phase
 # =========================================================================== #
 
 
@@ -145,88 +273,72 @@ def filter_repo(root: Path | str, options: FilterOptions | None = None) -> Filte
     if not root.is_dir():
         raise NotADirectoryError(f"{root} is not a directory")
 
-    # User rules: the root .analyzerignore file plus any extra patterns.
-    user: Rules = []
-    user_lines = list(options.extra_ignore)
-    analyzerignore = root / ".analyzerignore"
-    if analyzerignore.is_file():
-        user_lines += analyzerignore.read_text(encoding="utf-8", errors="ignore").splitlines()
-    if user_lines:
-        user.append(("", pathspec.GitIgnoreSpec.from_lines(user_lines)))
-
+    warnings: list[str] = []
     kept: list[FileEntry] = []
     skipped: list[SkippedEntry] = []
     counts: dict[str, int] = {}
 
-    def skip(rel: str, reason: SkipReason, is_dir: bool) -> None:
+    def skip(rel: str, reason: SkipReason, is_dir: bool = False) -> None:
         counts[reason] = counts.get(reason, 0) + 1
         if len(skipped) < options.max_skipped_listed:
-            skipped.append(SkippedEntry(path=rel, reason=reason, is_dir=is_dir))
+            skipped.append(SkippedEntry(path=printable(rel) + ("/" if is_dir else ""), reason=reason, is_dir=is_dir))
 
-    # `inherited` remembers the .gitignore rules that apply to each folder we still have to visit.
-    inherited: dict[str, Rules] = {"": []}
-    for dirpath, dirnames, filenames in os.walk(root):  # followlinks=False by default
-        here = Path(dirpath)
-        rel_dir = here.relative_to(root).as_posix()
-        rel_dir = "" if rel_dir == "." else rel_dir
+    # User rules: --exclude patterns, then the root .analyzerignore (last, so its '!' lines can win).
+    lines = list(options.extra_ignore) + _read_ignore_lines(str(root / ".analyzerignore"))
+    user = [r for r in [compile_ignore("", lines, ".analyzerignore / --exclude", warnings)] if r]
 
-        git = list(inherited.pop(rel_dir, []))
+    # Iterative depth-first walk (no recursion limit). Each item is a folder still to visit plus the
+    # .gitignore rules that apply inside it, ordered from the repo root down.
+    stack: list[tuple[str, str, list[IgnoreFile]]] = [("", str(root), [])]
+    while stack:
+        rel_dir, path_dir, git = stack.pop()
+        try:
+            with os.scandir(path_dir) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:                      # e.g. permission denied; os.walk would drop this silently
+            if not rel_dir:
+                raise                        # the root itself cannot be read: nothing to report
+            skip(rel_dir, "unreadable", True)
+            continue
+
         if options.use_gitignore:
-            own = _spec_from_file(here / ".gitignore")
+            gitignore = os.path.join(path_dir, ".gitignore")
+            own = compile_ignore(rel_dir, _read_ignore_lines(gitignore), gitignore, warnings)
             if own:
-                git.append((rel_dir, own))
+                git = git + [own]            # a new list: sibling folders keep sharing the parent's
+        siblings = {e.name for e in entries}
 
-        # --- folders: decide now, so ignored folders are never entered -------------------
-        descend = []
-        for d in sorted(dirnames):
-            rel = f"{rel_dir}/{d}".lstrip("/")
-            reason = _dir_skip_reason(here / d, rel, d, git, user)
-            if reason:
-                skip(rel + "/", reason, True)
-            else:
-                descend.append(d)
-                inherited[rel] = git
-        dirnames[:] = descend
-
-        # --- files -------------------------------------------------------------------------
-        for name in sorted(filenames):
-            p = here / name
-            rel = f"{rel_dir}/{name}".lstrip("/")
-            suffix = p.suffix.lower()
-            if p.is_symlink():
-                skip(rel, "symlink", False)
-            elif _matches(git, rel, False):
-                skip(rel, "gitignored", False)
-            elif _matches(user, rel, False):
-                skip(rel, "user_ignored", False)
-            elif suffix in BINARY_SUFFIXES:
-                skip(rel, "binary", False)
-            elif GENERATED_NAME.search(name):
-                skip(rel, "generated", False)
-            else:
-                try:
-                    size = p.stat().st_size
-                    if size > options.max_bytes:
-                        skip(rel, "too_large", False)
-                        continue
-                    data = p.read_bytes()  # read ONCE: used for the NUL check, header check and hash
-                except OSError:
-                    skip(rel, "unreadable", False)
-                    continue
-                if b"\0" in data[:BINARY_SNIFF_BYTES]:
-                    skip(rel, "binary", False)
-                elif _looks_generated(suffix, data):
-                    skip(rel, "generated", False)
+        subdirs = []
+        for e in entries:
+            rel = f"{rel_dir}/{e.name}" if rel_dir else e.name
+            try:
+                if not is_clean_name(e.name):
+                    skip(rel, "unreadable", e.is_dir(follow_symlinks=False))
+                elif is_link(e):
+                    skip(rel, "symlink", e.is_dir())          # follows the link only to know whether to print a "/"
+                elif e.is_dir(follow_symlinks=False):
+                    reason = dir_skip_reason(e.path, rel, e.name, siblings, git, user)
+                    if reason:
+                        skip(rel, reason, True)
+                    else:
+                        subdirs.append((rel, e.path, git))
                 else:
-                    kept.append(FileEntry(path=rel, size=size, sha256=hashlib.sha256(data).hexdigest(), suffix=suffix))
+                    reason, entry = judge_file(e, rel, git, user, options.max_bytes)
+                    if entry:
+                        kept.append(entry)
+                    else:
+                        skip(rel, reason)
+            except OSError:
+                skip(rel, "unreadable", False)
+        stack.extend(reversed(subdirs))      # reversed, so folders are visited in alphabetical order
 
-    # --- fingerprint: path + content hash of every kept file, in sorted order ----------------
-    # Only KEPT files count, so changing an ignored file does not change the fingerprint.
+    # Fingerprint: path + content hash of every kept file, in sorted order. Only KEPT files count,
+    # so changing an ignored file does not change it.
+    kept.sort(key=lambda e: e.path)
     digest = hashlib.sha256()
-    for e in sorted(kept, key=lambda e: e.path):
+    for e in kept:
         digest.update(f"{e.path}\0{e.sha256}\n".encode())
 
-    warnings = []
     if sum(counts.values()) > len(skipped):
         warnings.append(f"Skipped list truncated to {len(skipped)} entries; skipped_counts is exact.")
     if not kept:
@@ -238,5 +350,7 @@ def filter_repo(root: Path | str, options: FilterOptions | None = None) -> Filte
 
 
 def read_text(root: Path | str, rel: str) -> str:
-    """Read a kept file as text (later phases use this for manifests and source files)."""
+    """Read a kept file as text (later phases use this for manifests and source files).
+    Bytes that are not valid UTF-8 are replaced. It does not re-check the filter, so pass a
+    path that Phase 1 kept."""
     return (Path(root) / rel).read_text(encoding="utf-8", errors="replace")

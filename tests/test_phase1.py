@@ -210,3 +210,101 @@ def test_result_records_size_hash_suffix_and_read_text(tmp_path):
     e = r.files[0]
     assert (e.path, e.size, e.suffix, len(e.sha256)) == ("Mod.PY", 6, ".py", 64)   # suffix is lower-cased
     assert read_text(tmp_path, "Mod.PY") == "x = 1\n" and r.total_bytes == 6
+
+
+# --------------------------------------------------------------------------- #
+# Robustness and git-correctness (each of these used to crash, hang or misjudge)
+# --------------------------------------------------------------------------- #
+def test_deeper_gitignore_can_reinclude_what_a_parent_ignored(tmp_path):
+    write(tmp_path, ".gitignore", "*.log\n")
+    write(tmp_path, "sub/.gitignore", "!keep.log\n")
+    write(tmp_path, "sub/keep.log", "x\n")
+    write(tmp_path, "sub/drop.log", "x\n")
+    r = filter_repo(tmp_path)
+    assert "sub/keep.log" in kept(r) and reasons(r)["sub/drop.log"] == "gitignored"
+
+
+def test_gitignore_with_utf8_bom_still_works(tmp_path):
+    write(tmp_path, ".gitignore", b"\xef\xbb\xbfsecret.py\n")
+    write(tmp_path, "secret.py", "x = 1\n")
+    assert "secret.py" not in kept(filter_repo(tmp_path))
+
+
+def test_malformed_ignore_line_is_dropped_with_a_warning(tmp_path):
+    write(tmp_path, ".gitignore", "[z-a]\nreal.py\n")
+    write(tmp_path, "real.py", "x = 1\n")
+    write(tmp_path, "ok.py", "x = 1\n")
+    r = filter_repo(tmp_path)
+    assert kept(r) == {".gitignore", "ok.py"} and any("[z-a]" in w for w in r.warnings)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
+def test_symlinked_gitignore_is_not_followed(tmp_path):
+    outside = tmp_path / "outside"
+    write(outside, "rules", "a.py\n")
+    repo = tmp_path / "repo"
+    write(repo, "a.py", "x = 1\n")
+    try:
+        os.symlink(outside / "rules", repo / ".gitignore")
+    except OSError:
+        pytest.skip("cannot create symlinks here")
+    assert "a.py" in kept(filter_repo(repo))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX file names")
+def test_file_name_that_is_not_valid_unicode_does_not_crash(tmp_path):
+    write(tmp_path, "ok.py", "x = 1\n")
+    with open(os.fsencode(tmp_path) + b"/caf\xe9.py", "wb") as f:
+        f.write(b"x\n")
+    r = filter_repo(tmp_path)
+    assert kept(r) == {"ok.py"} and r.skipped_counts == {"unreadable": 1}
+    r.model_dump_json()                      # must be serialisable
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
+def test_named_pipe_is_never_opened(tmp_path):
+    write(tmp_path, "ok.py", "x = 1\n")
+    os.mkfifo(tmp_path / "pipe.py")
+    r = filter_repo(tmp_path)
+    assert kept(r) == {"ok.py"} and reasons(r)["pipe.py"] == "unreadable"
+
+
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), reason="root can read everything")
+def test_unreadable_folder_is_reported_not_silently_dropped(tmp_path):
+    write(tmp_path, "ok/a.py", "x = 1\n")
+    write(tmp_path, "locked/b.py", "x = 1\n")
+    (tmp_path / "locked").chmod(0)
+    try:
+        r = filter_repo(tmp_path)
+    finally:
+        (tmp_path / "locked").chmod(0o755)
+    assert kept(r) == {"ok/a.py"} and reasons(r) == {"locked/": "unreadable"}
+
+
+def test_ide_and_tooling_folders_and_context_dependent_target(tmp_path):
+    for rel in (".idea/w.xml", ".vscode/s.json", ".next/c.js", "src/lib.rs"):
+        write(tmp_path, rel, "x\n")
+    write(tmp_path, "Cargo.toml", "[package]\n")
+    write(tmp_path, "target/debug/x.rs", "x\n")          # Rust build output: sibling Cargo.toml proves it
+    write(tmp_path, "app/target/Real.java", "x\n")        # no pom.xml/Cargo.toml next to it: normal source folder
+    r = filter_repo(tmp_path)
+    assert kept(r) == {"Cargo.toml", "src/lib.rs", "app/target/Real.java"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows MAX_PATH limits very deep single-segment chains")
+def test_very_deep_tree_has_no_recursion_limit(tmp_path):
+    depth = 1200                             # deeper than Python's default recursion limit (1000)
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        for _ in range(depth):               # built (and later removed) with chdir: pathlib/shutil recurse
+            os.mkdir("d")
+            os.chdir("d")
+        write(Path("."), "leaf.py", "x = 1\n")
+        assert len(filter_repo(tmp_path).files) == 1
+        os.remove("leaf.py")
+        for _ in range(depth):               # pytest cannot delete a tree this deep itself, so we do
+            os.chdir("..")
+            os.rmdir("d")
+    finally:
+        os.chdir(cwd)
